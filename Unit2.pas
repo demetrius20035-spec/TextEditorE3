@@ -1,4 +1,4 @@
-unit Unit2;
+п»їunit Unit2;
 
 interface
 
@@ -29,6 +29,7 @@ type
     LabelExecutable: TLabel;
     LabelFileName: TLabel;
     LabelArguments: TLabel;
+    function SettingsFileName: string;
   public
     { Public declarations }
   end;
@@ -40,90 +41,87 @@ implementation
 
 {$R *.dfm}
 
+function TForm2.SettingsFileName: string;
+begin
+  Result := IncludeTrailingPathDelimiter(ExtractFileDir(Application.ExeName)) +
+            'run_settings.ini';
+end;
+
 procedure TForm2.FormCreate(Sender: TObject);
 begin
-  Self.Caption := 'Run Settings';
+  Self.Caption := 'РќР°СЃС‚СЂРѕР№РєРё Р·Р°РїСѓСЃРєР°';
+
+  // The old build hid Memo1 and created three Edit boxes that were never wired
+  // to anything, so the dialog edited an invisible memo. Build a small, working
+  // "Run configuration" form instead.
   Memo1.Visible := False;
-  Label1.Visible := False;
   Label2.Visible := False;
-  Label3.Visible := False;
-  {Label4.Visible := False;}
-  Label5.Visible := False;
+
+  // The Save button has Kind = bkYes (auto-closes with mrYes). Disarm it so we
+  // can keep the dialog open when saving fails.
+  BitBtn1.ModalResult := mrNone;
 
   LabelExecutable := TLabel.Create(Self);
   LabelExecutable.Parent := Self;
-  LabelExecutable.Caption := 'Executable:';
-  LabelExecutable.Top := 20;
-  LabelExecutable.Left := 10;
+  LabelExecutable.Caption := 'РСЃРїРѕР»РЅСЏРµРјС‹Р№ С„Р°Р№Р» (Executable):';
+  LabelExecutable.SetBounds(16, 50, 200, 15);
 
   EditExecutable := TEdit.Create(Self);
   EditExecutable.Parent := Self;
-  EditExecutable.Top := 40;
-  EditExecutable.Left := 10;
-  EditExecutable.Width := Self.Width - 40;
+  EditExecutable.SetBounds(16, 67, 195, 23);
 
   LabelFileName := TLabel.Create(Self);
   LabelFileName.Parent := Self;
-  LabelFileName.Caption := 'File Name:';
-  LabelFileName.Top := 70;
-  LabelFileName.Left := 10;
+  LabelFileName.Caption := 'Р¤Р°Р№Р» СЃРєСЂРёРїС‚Р° (FileName):';
+  LabelFileName.SetBounds(16, 96, 200, 15);
 
   EditFileName := TEdit.Create(Self);
   EditFileName.Parent := Self;
-  EditFileName.Top := 90;
-  EditFileName.Left := 10;
-  EditFileName.Width := Self.Width - 40;
+  EditFileName.SetBounds(16, 113, 195, 23);
 
   LabelArguments := TLabel.Create(Self);
   LabelArguments.Parent := Self;
-  LabelArguments.Caption := 'Arguments:';
-  LabelArguments.Top := 120;
-  LabelArguments.Left := 10;
+  LabelArguments.Caption := 'РђСЂРіСѓРјРµРЅС‚С‹ (Arguments):';
+  LabelArguments.SetBounds(16, 142, 200, 15);
 
   EditArguments := TEdit.Create(Self);
   EditArguments.Parent := Self;
-  EditArguments.Top := 140;
-  EditArguments.Left := 10;
-  EditArguments.Width := Self.Width - 40;
-
-  BitBtn1.Top := 180;
+  EditArguments.SetBounds(16, 159, 195, 23);
 end;
 
 procedure TForm2.FormShow(Sender: TObject);
 var
-  SettingsFileName: string;
+  Ini: TIniFile;
 begin
-  SettingsFileName := ExtractFileDir(Application.ExeName) + '\run_settings.ini';
-  if FileExists(SettingsFileName) then
-  begin
-    Memo1.Lines.LoadFromFile(SettingsFileName);
-  end
-  else
-  begin
-    // Если файла нет, можно вставить текст по умолчанию
-    Memo1.Lines.Clear;
-    Memo1.Lines.Add('[Run]');
-    Memo1.Lines.Add('Executable=python');
-    Memo1.Lines.Add('FileName=source.py');
-    Memo1.Lines.Add('Arguments=');
+  Ini := TIniFile.Create(SettingsFileName);
+  try
+    EditExecutable.Text := Ini.ReadString('Run', 'Executable', 'python');
+    EditFileName.Text   := Ini.ReadString('Run', 'FileName', 'source.py');
+    EditArguments.Text  := Ini.ReadString('Run', 'Arguments', '');
+  finally
+    Ini.Free;
   end;
 end;
 
 procedure TForm2.BitBtn1Click(Sender: TObject);
 var
-  SettingsFileName: string;
+  Ini: TIniFile;
 begin
-  SettingsFileName := ExtractFileDir(Application.ExeName) + '\run_settings.ini';
+  Ini := TIniFile.Create(SettingsFileName);
   try
-    Memo1.Lines.SaveToFile(SettingsFileName);
-    // Закрываем форму после успешного сохранения.
-    // ModalResult := mrOk говорит главному окну, что мы нажали "ОК"
-    ModalResult := mrOk;
-  except
-    on E: Exception do
-    begin
-      MessageDlg('Не удалось сохранить файл настроек: ' + E.Message, mtError, [mbOk], 0);
+    try
+      Ini.WriteString('Run', 'Executable', Trim(EditExecutable.Text));
+      Ini.WriteString('Run', 'FileName', Trim(EditFileName.Text));
+      Ini.WriteString('Run', 'Arguments', Trim(EditArguments.Text));
+      Ini.UpdateFile;
+      ModalResult := mrOk;
+    except
+      on E: Exception do
+        MessageDlg('РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ С„Р°Р№Р» РЅР°СЃС‚СЂРѕРµРє: ' + E.Message,
+                   mtError, [mbOk], 0);
     end;
+  finally
+    Ini.Free;
   end;
 end;
 

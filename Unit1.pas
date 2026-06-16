@@ -83,14 +83,16 @@ type
     procedure ComboBox3Change(Sender: TObject);
   private
     { Private declarations }
-    FScrollTimer: TTimer;
-    LineNumberMemo: TRichEdit;
+    FGutter: TPaintBox;
     FSyntaxRules: TDictionary<string, TDictionary<string, TStringList>>;
     FHighlightTimer: TTimer;
     FOriginalRichEditWndProc: TWndMethod;
     procedure RichEditWindowProc(var Message: TMessage);
     procedure UpdateLineNumbers;
-    procedure SyncScroll;
+    procedure GutterPaint(Sender: TObject);
+    procedure InvalidateGutter;
+    procedure FreeSyntaxRules;
+    procedure DoDestroy(Sender: TObject);
     procedure SaveFile(const AFileName: string);
     procedure AddToOutput(const AText: string; AColor: TColor);
     procedure LoadFile(const AFileName: string);
@@ -99,7 +101,6 @@ type
     procedure HighlightLine(LineNum: Integer; Rules: TDictionary<string, TStringList>);
     function StringToColor(const S: string): TColor;
     procedure OnHighlightTimer(Sender: TObject);
-    procedure OnScrollTimer(Sender: TObject);
     procedure UpdateCursorPosStatus;
     function GetSelectedEncoding: TEncoding;
   public
@@ -120,6 +121,7 @@ type
     procedure Execute; override;
   public
     constructor Create(APipeHandle: THandle; AOutputCallback: TOutputCallback; AColor: TColor);
+    destructor Destroy; override;
   end;
 
 Settings=Record
@@ -133,7 +135,7 @@ Settings=Record
 var
   Form1: TForm1;
   Param: Settings;
-  Text_Attrib: String[3]; {{������ �������� ������: ������, ������ ��� ������������}
+  Text_Attrib: String[3]; {Атрибуты стиля выделенного текста: [1]=жирный, [2]=курсив, [3]=подчёркнутый}
   File_Path,File_Name: String;
 
 implementation
@@ -141,11 +143,10 @@ implementation
 uses Unit2;
 
 const
-  EM_GETSCROLLPOS = $04DD;
-  EM_SETSCROLLPOS = $04DE;
-  EM_SETLANGOPTIONS = $0478;
-  EM_GETLANGOPTIONS = $0479;
-  IMF_NOSCROLL      = $0800;
+  // Rich Edit "extended set text limit" message (normally in Winapi.RichEdit);
+  // re-declared here to lift the default ~32 KB editor limit without pulling in
+  // the whole unit.
+  EM_EXLIMITTEXT = $0435;
 
 { TOutputReaderThread }
 constructor TOutputReaderThread.Create(APipeHandle: THandle; AOutputCallback: TOutputCallback; AColor: TColor);
@@ -155,6 +156,13 @@ begin
   FOutputCallback := AOutputCallback;
   FColor := AColor;
   FreeOnTerminate := True;
+end;
+
+destructor TOutputReaderThread.Destroy;
+begin
+  if FPipeHandle <> 0 then
+    CloseHandle(FPipeHandle);
+  inherited;
 end;
 
 procedure TOutputReaderThread.Execute;
@@ -242,7 +250,7 @@ begin
   If Code=0 Then
   begin
     Form1.RichEdit1.SelAttributes.Size:=Vrem;
-    LineNumberMemo.Font.Size := Vrem;
+    InvalidateGutter;
   end
   Else MessageDLG('Размер шрифта должен быть числовым значением.'+
          #13+'Введите правильное значение размера!',mtInformation,[mbOk],0);
@@ -278,7 +286,7 @@ begin
   Strings := TStringList.Create;
   try
     Strings.Text := RichEdit1.Text;
-    Strings.SaveToFile(FullFileName);
+    Strings.SaveToFile(FullFileName, TEncoding.UTF8);
   finally
     Strings.Free;
   end;
@@ -403,17 +411,14 @@ procedure TForm1.RichEdit1KeyUp(Sender: TObject; var Key: Word;
 begin
   Font_Delta;
   if Key in [VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT, VK_HOME, VK_END] then
-  begin
-    FScrollTimer.Enabled := False;
-    FScrollTimer.Enabled := True;
-  end;
+    InvalidateGutter;
   UpdateCursorPosStatus;
 end;
 
 procedure TForm1.ComboBox1Change(Sender: TObject);
 begin
   Form1.RichEdit1.SelAttributes.Name:=Form1.ComboBox1.Text;
-  LineNumberMemo.Font.Name := Form1.RichEdit1.SelAttributes.Name;
+  InvalidateGutter;
 end;
 
 procedure TForm1.SpeedButton7Click(Sender: TObject);
@@ -572,7 +577,6 @@ end;
 procedure TForm1.FormCreate(Sender: TObject);
 Var F: File of Settings;
     i: Integer;
-    LangOpts: Longint;
 begin
   RichEdit2.Text := 'Консоль';
   RichEdit2.ScrollBars := ssBoth;
@@ -581,18 +585,14 @@ begin
   SaveDialog1.Filter := 'Rich Text Format (*.rtf)|*.rtf|Plain Text (*.txt)|*.txt|All files (*.*)|*.*';
   SaveDialog1.DefaultExt := 'rtf';
 
-  LineNumberMemo := TRichEdit.Create(Self);
-  with LineNumberMemo do
-  begin
-    Parent := Panel1;
-    Width := 45;
-    Align := alLeft;
-    ScrollBars := ssNone;
-    ReadOnly := True;
-    Color := clBtnFace;
-    WordWrap := False;
-    SetWindowLong(Handle, GWL_STYLE, GetWindowLong(Handle, GWL_STYLE) or ES_RIGHT);
-  end;
+  // Line-number gutter: a lightweight paint surface that draws numbers aligned
+  // to the real on-screen position of each line (see GutterPaint). This replaces
+  // the old "second RichEdit + scroll-sync timer" hack.
+  FGutter := TPaintBox.Create(Self);
+  FGutter.Parent := Panel1;
+  FGutter.Align := alLeft;
+  FGutter.Width := 48;
+  FGutter.OnPaint := GutterPaint;
 
   // Setup StatusBar
   with StatusBar1.Panels.Add do
@@ -604,13 +604,9 @@ begin
   // Ensure RichEdit1 is also in Panel1 and fills the remaining space
   RichEdit1.Parent := Panel1;
   RichEdit1.Align := alClient;
-
-  // Force line-by-line scrolling on BOTH RichEdit controls for perfect sync
-  {LangOpts := SendMessage(RichEdit1.Handle, EM_GETLANGOPTIONS, 0, 0);
-  SendMessage(RichEdit1.Handle, EM_SETLANGOPTIONS, 0, LangOpts or IMF_NOSCROLL);
-
-  LangOpts := SendMessage(LineNumberMemo.Handle, EM_GETLANGOPTIONS, 0, 0);
-  SendMessage(LineNumberMemo.Handle, EM_SETLANGOPTIONS, 0, LangOpts or IMF_NOSCROLL);}
+  RichEdit1.WordWrap := False;   // code shouldn't wrap; keeps 1 logical line = 1 row
+  // Lift the default ~32 KB text limit so large source files load fully.
+  SendMessage(RichEdit1.Handle, EM_EXLIMITTEXT, 0, $7FFFFFFE);
 
   If FileExists(ExtractFileDir(Application.ExeName)+'\Settings.inf')=True
     Then Begin
@@ -632,8 +628,7 @@ begin
            Font_Style;
          End Else
          Begin
-           MessageDLG('Файл настроек не найден! Будут использованы'+#13+
-                      'настройки по умолчанию.',mtError,[mbOk],0);
+           {Файл настроек не найден — молча применяем значения по умолчанию.}
            Text_Attrib:='000';
            Param.Align:=taLeftJustify;
            Param.Font_Name:='Times New Roman';
@@ -641,8 +636,6 @@ begin
            Param.Font_Color:=clBlack;
            Param.Text_Attrib:=Text_Attrib;
          End;
-  LineNumberMemo.Font.Name := Param.Font_Name;
-  LineNumberMemo.Font.Size := Param.Font_Size;
   UpdateLineNumbers;
   File_Path:=ExtractFileDir(Application.ExeName)+'\';
   File_Name:='NoName.rtf';
@@ -658,19 +651,15 @@ begin
   FHighlightTimer.OnTimer := OnHighlightTimer;
   FHighlightTimer.Enabled := False;
 
-  FScrollTimer := TTimer.Create(Self);
-  FScrollTimer.Interval := 100;
-  FScrollTimer.Enabled := False;
-  FScrollTimer.OnTimer := OnScrollTimer;
-
   FOriginalRichEditWndProc := RichEdit1.WindowProc;
   RichEdit1.WindowProc := RichEditWindowProc;
+  Self.OnDestroy := DoDestroy;
 
   ComboBox3.Items.Clear;
   ComboBox3.Items.Add('UTF8');
   ComboBox3.Items.Add('CP1251');
   ComboBox3.Items.Add('CP866');
-  ComboBox3.ItemIndex := 1;
+  ComboBox3.ItemIndex := 0;   // default to UTF-8 (best for source code / Python)
 end;
 
 procedure TForm1.N19Click(Sender: TObject);
@@ -680,35 +669,72 @@ end;
 
 procedure TForm1.UpdateLineNumbers;
 var
-  i, lineCount: Integer;
+  LineCount, Digits, NewWidth: Integer;
 begin
-  lineCount := SendMessage(RichEdit1.Handle, EM_GETLINECOUNT, 0, 0);
-  if lineCount = 0 then lineCount := 1;
+  if FGutter = nil then Exit;
 
-  if LineNumberMemo.Lines.Count <> lineCount then
-  begin
-    LineNumberMemo.Lines.BeginUpdate;
-    try
-      LineNumberMemo.Lines.Clear;
-      for i := 1 to lineCount do
-      begin
-        LineNumberMemo.Lines.Add(IntToStr(i));
-      end;
-    finally
-      LineNumberMemo.Lines.EndUpdate;
-    end;
-  end;
-  SyncScroll;
+  LineCount := SendMessage(RichEdit1.Handle, EM_GETLINECOUNT, 0, 0);
+  if LineCount < 1 then LineCount := 1;
+
+  // Grow the gutter to fit the widest line number (minimum two digits).
+  Digits := Length(IntToStr(LineCount));
+  if Digits < 2 then Digits := 2;
+  FGutter.Canvas.Font.Assign(RichEdit1.Font);
+  NewWidth := FGutter.Canvas.TextWidth('0') * Digits + 12;
+  if FGutter.Width <> NewWidth then
+    FGutter.Width := NewWidth;
+
+  InvalidateGutter;
 end;
 
-procedure TForm1.SyncScroll;
-var
-  sp: TPoint;
+procedure TForm1.InvalidateGutter;
 begin
-  // Get RichEdit1's scroll position
-  SendMessage(RichEdit1.Handle, EM_GETSCROLLPOS, 0, LPARAM(@sp));
-  // Set LineNumberMemo's scroll position
-  SendMessage(LineNumberMemo.Handle, EM_SETSCROLLPOS, 0, LPARAM(@sp));
+  if FGutter <> nil then
+    FGutter.Invalidate;
+end;
+
+procedure TForm1.GutterPaint(Sender: TObject);
+var
+  FirstLine, LineCount, i: Integer;
+  CharIndex: Integer;
+  Pt: TPoint;
+  S: string;
+  C: TCanvas;
+  ClientH: Integer;
+begin
+  C := FGutter.Canvas;
+
+  // Background + right-hand separator.
+  C.Brush.Style := bsSolid;
+  C.Brush.Color := clBtnFace;
+  C.FillRect(FGutter.ClientRect);
+  C.Pen.Color := clBtnShadow;
+  C.MoveTo(FGutter.ClientWidth - 1, 0);
+  C.LineTo(FGutter.ClientWidth - 1, FGutter.ClientHeight);
+
+  if not RichEdit1.HandleAllocated then Exit;
+
+  C.Font.Assign(RichEdit1.Font);
+  C.Font.Color := clGrayText;
+  C.Brush.Style := bsClear;
+
+  LineCount := SendMessage(RichEdit1.Handle, EM_GETLINECOUNT, 0, 0);
+  FirstLine := SendMessage(RichEdit1.Handle, EM_GETFIRSTVISIBLELINE, 0, 0);
+  ClientH := RichEdit1.ClientHeight;
+
+  // Walk the visible lines and paint each number at the line's real Y position,
+  // so the numbers stay aligned no matter the font size or scroll offset.
+  for i := FirstLine to LineCount - 1 do
+  begin
+    CharIndex := RichEdit1.Perform(EM_LINEINDEX, i, 0);
+    if CharIndex < 0 then Continue;
+    Pt.X := 0;
+    Pt.Y := 0;
+    SendMessage(RichEdit1.Handle, EM_POSFROMCHAR, WPARAM(@Pt), CharIndex);
+    if Pt.Y > ClientH then Break;
+    S := IntToStr(i + 1);
+    C.TextOut(FGutter.ClientWidth - C.TextWidth(S) - 5, Pt.Y, S);
+  end;
 end;
 
 procedure TForm1.SaveFile(const AFileName: string);
@@ -771,7 +797,7 @@ begin
   RichEdit1.Tag := 0;
   UpdateLineNumbers;
   ApplySyntaxHighlighting(True);
-  SyncScroll;
+  InvalidateGutter;
   UpdateCursorPosStatus;
 end;
 
@@ -786,52 +812,6 @@ procedure TForm1.OnHighlightTimer(Sender: TObject);
 begin
   FHighlightTimer.Enabled := False;
   ApplySyntaxHighlighting(False);
-end;
-
-procedure TForm1.OnScrollTimer(Sender: TObject);
-var
-  ScrollPos: TPoint;
-  FirstLine, LineStart: Integer;
-  LinePos: TPoint;
-  NewScrollY: Integer;
-begin
-  FScrollTimer.Enabled := False;
-
-  // Get current scroll position (absolute)
-  SendMessage(RichEdit1.Handle, EM_GETSCROLLPOS, 0, LPARAM(@ScrollPos));
-
-  // Get info about the first visible line
-  FirstLine := SendMessage(RichEdit1.Handle, EM_GETFIRSTVISIBLELINE, 0, 0);
-  LineStart := SendMessage(RichEdit1.Handle, EM_LINEINDEX, FirstLine, 0);
-  if LineStart = -1 then
-  begin
-    SyncScroll; // sync anyway and exit
-    Exit;
-  end;
-
-  // Get the line's position relative to the client area
-  SendMessage(RichEdit1.Handle, EM_POSFROMCHAR, WPARAM(@LinePos), LineStart);
-
-  // We only adjust if the line is not already at the target position (3px)
-  // or if the line is partially scrolled off the top (y < 0)
-  if (LinePos.y <> 3) then
-  begin
-    // Calculate what the new absolute scroll position should be.
-    // NewScrollY = Absolute_Line_Pos - Desired_Relative_Y
-    // Absolute_Line_Pos = Current_Relative_Y + Current_Absolute_Scroll_Y
-    NewScrollY := (LinePos.y + ScrollPos.y) - 3;
-
-    if NewScrollY < 0 then NewScrollY := 0;
-
-    if NewScrollY <> ScrollPos.y then
-    begin
-      ScrollPos.y := NewScrollY;
-      SendMessage(RichEdit1.Handle, EM_SETSCROLLPOS, 0, LPARAM(@ScrollPos));
-    end;
-  end;
-
-  // Now that RichEdit1 is perfectly positioned, sync the line number memo
-  SyncScroll;
 end;
 
 procedure TForm1.LoadSyntaxRules;
@@ -985,13 +965,12 @@ procedure TForm1.RichEditWindowProc(var Message: TMessage);
 begin
   FOriginalRichEditWndProc(Message);
 
+  // Repaint the gutter whenever the editor scrolls or is resized so the numbers
+  // track the visible text exactly. No timers, no scroll-position guessing.
   if (Message.Msg = WM_VSCROLL) or
-     (Message.Msg = WM_HSCROLL) or
-     (Message.Msg = WM_MOUSEWHEEL) then
-  begin
-    FScrollTimer.Enabled := False;
-    FScrollTimer.Enabled := True;
-  end;
+     (Message.Msg = WM_MOUSEWHEEL) or
+     (Message.Msg = WM_SIZE) then
+    InvalidateGutter;
 end;
 
 procedure TForm1.UpdateCursorPosStatus;
@@ -1033,6 +1012,27 @@ begin
     Result := TEncoding.GetEncoding(866)
   else // Default to UTF8
     Result := TEncoding.UTF8;
+end;
+
+procedure TForm1.FreeSyntaxRules;
+var
+  Outer: TPair<string, TDictionary<string, TStringList>>;
+  Inner: TPair<string, TStringList>;
+begin
+  if FSyntaxRules = nil then Exit;
+  for Outer in FSyntaxRules do
+  begin
+    for Inner in Outer.Value do
+      Inner.Value.Free;
+    Outer.Value.Free;
+  end;
+  FSyntaxRules.Free;
+  FSyntaxRules := nil;
+end;
+
+procedure TForm1.DoDestroy(Sender: TObject);
+begin
+  FreeSyntaxRules;
 end;
 
 end.
