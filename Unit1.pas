@@ -90,6 +90,7 @@ type
     FFindDialog: TFindDialog;
     FReplaceDialog: TReplaceDialog;
     FRunningProcess: THandle;
+    FWheelAccum: Integer;
     FMRU: TStringList;
     FMRUMenu: TMenuItem;
     FStopItem: TMenuItem;
@@ -973,15 +974,35 @@ begin
 end;
 
 procedure TForm1.RichEditWindowProc(var Message: TMessage);
+var
+  Lines: Integer;
 begin
-  // Ctrl + mouse wheel zooms instead of scrolling.
-  if (Message.Msg = WM_MOUSEWHEEL) and
-     ((TWMMouseWheel(Message).Keys and MK_CONTROL) <> 0) then
+  if Message.Msg = WM_MOUSEWHEEL then
   begin
-    if TWMMouseWheel(Message).WheelDelta > 0 then
-      ZoomBy(10)
-    else
-      ZoomBy(-10);
+    // Ctrl + wheel = zoom.
+    if (TWMMouseWheel(Message).Keys and MK_CONTROL) <> 0 then
+    begin
+      if TWMMouseWheel(Message).WheelDelta > 0 then
+        ZoomBy(10)
+      else
+        ZoomBy(-10);
+      Message.Result := 0;
+      Exit;
+    end;
+
+    // Take over wheel scrolling entirely: scroll by whole lines, instantly.
+    // RichEdit's own wheel handler animates the scroll over several frames while
+    // EM_POSFROMCHAR already reports the final position — that mismatch is what
+    // made the gutter race ahead of the text. Doing a discrete EM_LINESCROLL
+    // keeps text and gutter locked together and the top line line-aligned.
+    FWheelAccum := FWheelAccum + TWMMouseWheel(Message).WheelDelta;
+    Lines := FWheelAccum div WHEEL_DELTA;
+    FWheelAccum := FWheelAccum - Lines * WHEEL_DELTA;
+    if Lines <> 0 then
+    begin
+      SendMessage(RichEdit1.Handle, EM_LINESCROLL, 0, -Lines * 3);
+      InvalidateGutter;
+    end;
     Message.Result := 0;
     Exit;
   end;
@@ -991,7 +1012,6 @@ begin
   // Repaint the gutter whenever the editor scrolls or is resized so the numbers
   // track the visible text exactly. No timers, no scroll-position guessing.
   if (Message.Msg = WM_VSCROLL) or
-     (Message.Msg = WM_MOUSEWHEEL) or
      (Message.Msg = WM_SIZE) then
     InvalidateGutter;
 end;
