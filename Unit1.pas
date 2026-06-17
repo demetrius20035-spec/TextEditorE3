@@ -90,10 +90,12 @@ type
     FFindDialog: TFindDialog;
     FReplaceDialog: TReplaceDialog;
     FRunningProcess: THandle;
+    FWheelAccum: Integer;
     FMRU: TStringList;
     FMRUMenu: TMenuItem;
     FStopItem: TMenuItem;
     FWrapItem: TMenuItem;
+    FLineNumItem: TMenuItem;
     procedure RichEditWindowProc(var Message: TMessage);
     procedure WMDropFiles(var Msg: TWMDropFiles); message WM_DROPFILES;
     procedure UpdateLineNumbers;
@@ -114,6 +116,8 @@ type
     procedure GoToLine;
     procedure ToggleComment;
     procedure ToggleWordWrap;
+    procedure ToggleLineNumbers;
+    procedure ShowCheatSheet;
     procedure ZoomBy(Delta: Integer);
     procedure RunScript;
     procedure StopRunning;
@@ -192,11 +196,16 @@ const
   // re-declared here to lift the default ~32 KB editor limit without pulling in
   // the whole unit.
   EM_EXLIMITTEXT = $0435;
+  // EM_SETTARGETDEVICE with a non-zero line width reliably turns OFF word wrap
+  // in a Rich Edit (WordWrap := False alone is not enough — the engine keeps
+  // wrapping to the window width, which de-synced the line-number gutter).
+  EM_SETTARGETDEVICE = $0448;
 
   // Menu command ids (TMenuItem.Tag) dispatched by MenuClick.
   cmdFind = 10; cmdReplace = 11; cmdGoto = 12; cmdComment = 13;
   cmdWrap = 20; cmdZoomIn = 21; cmdZoomOut = 22; cmdZoomReset = 23;
   cmdRun = 30; cmdStop = 31;
+  cmdLineNumbers = 40; cmdCheatSheet = 41;
   cmdMRUBase = 1000;
 
 { TOutputReaderThread }
@@ -582,6 +591,10 @@ begin
   // Lift the default ~32 KB text limit so large source files load fully.
   // (Sent after the style changes above, which recreate the window handle.)
   SendMessage(RichEdit1.Handle, EM_EXLIMITTEXT, 0, $7FFFFFFE);
+  // Actually disable word wrap (WordWrap := False alone is not reliable in
+  // RichEdit). With wrap off, on-screen rows == logical lines, so the gutter
+  // numbers line up exactly.
+  SendMessage(RichEdit1.Handle, EM_SETTARGETDEVICE, 0, 1);
 
   If FileExists(ExtractFileDir(Application.ExeName)+'\Settings.inf')=True
     Then Begin
@@ -961,15 +974,35 @@ begin
 end;
 
 procedure TForm1.RichEditWindowProc(var Message: TMessage);
+var
+  Lines: Integer;
 begin
-  // Ctrl + mouse wheel zooms instead of scrolling.
-  if (Message.Msg = WM_MOUSEWHEEL) and
-     ((TWMMouseWheel(Message).Keys and MK_CONTROL) <> 0) then
+  if Message.Msg = WM_MOUSEWHEEL then
   begin
-    if TWMMouseWheel(Message).WheelDelta > 0 then
-      ZoomBy(10)
-    else
-      ZoomBy(-10);
+    // Ctrl + wheel = zoom.
+    if (TWMMouseWheel(Message).Keys and MK_CONTROL) <> 0 then
+    begin
+      if TWMMouseWheel(Message).WheelDelta > 0 then
+        ZoomBy(10)
+      else
+        ZoomBy(-10);
+      Message.Result := 0;
+      Exit;
+    end;
+
+    // Take over wheel scrolling entirely: scroll by whole lines, instantly.
+    // RichEdit's own wheel handler animates the scroll over several frames while
+    // EM_POSFROMCHAR already reports the final position — that mismatch is what
+    // made the gutter race ahead of the text. Doing a discrete EM_LINESCROLL
+    // keeps text and gutter locked together and the top line line-aligned.
+    FWheelAccum := FWheelAccum + TWMMouseWheel(Message).WheelDelta;
+    Lines := FWheelAccum div WHEEL_DELTA;
+    FWheelAccum := FWheelAccum - Lines * WHEEL_DELTA;
+    if Lines <> 0 then
+    begin
+      SendMessage(RichEdit1.Handle, EM_LINESCROLL, 0, -Lines * 3);
+      InvalidateGutter;
+    end;
     Message.Result := 0;
     Exit;
   end;
@@ -979,7 +1012,6 @@ begin
   // Repaint the gutter whenever the editor scrolls or is resized so the numbers
   // track the visible text exactly. No timers, no scroll-position guessing.
   if (Message.Msg = WM_VSCROLL) or
-     (Message.Msg = WM_MOUSEWHEEL) or
      (Message.Msg = WM_SIZE) then
     InvalidateGutter;
 end;
@@ -1077,7 +1109,7 @@ procedure TForm1.BuildMenus;
   end;
 
 var
-  EditMenu, ViewMenu, RunMenu: TMenuItem;
+  EditMenu, ViewMenu, RunMenu, HelpMenu: TMenuItem;
 begin
   // Accelerators for the existing File menu items.
   N2.ShortCut := ShortCut(Ord('N'), [ssCtrl]);
@@ -1102,6 +1134,8 @@ begin
   ViewMenu := TMenuItem.Create(MainMenu1);
   ViewMenu.Caption := 'Вид';
   MainMenu1.Items.Insert(2, ViewMenu);
+  FLineNumItem := Mk(ViewMenu, 'Номера строк', cmdLineNumbers, 0);
+  FLineNumItem.Checked := FGutter.Visible;
   FWrapItem := Mk(ViewMenu, 'Перенос строк', cmdWrap, 0);
   FWrapItem.Checked := RichEdit1.WordWrap;
   Mk(ViewMenu, '-', -1, 0);
@@ -1115,6 +1149,11 @@ begin
   Mk(RunMenu, 'Выполнить', cmdRun, ShortCut(VK_F5, []));
   FStopItem := Mk(RunMenu, 'Остановить', cmdStop, ShortCut(VK_F2, [ssCtrl]));
   FStopItem.Enabled := False;
+
+  HelpMenu := TMenuItem.Create(MainMenu1);
+  HelpMenu.Caption := 'Справка';
+  MainMenu1.Items.Add(HelpMenu);
+  Mk(HelpMenu, 'Шпаргалка (возможности и клавиши)', cmdCheatSheet, ShortCut(VK_F1, []));
 end;
 
 procedure TForm1.MenuClick(Sender: TObject);
@@ -1137,6 +1176,8 @@ begin
       end;
     cmdRun: RunScript;
     cmdStop: StopRunning;
+    cmdLineNumbers: ToggleLineNumbers;
+    cmdCheatSheet: ShowCheatSheet;
   else
     if (ATag >= cmdMRUBase) and ((ATag - cmdMRUBase) < FMRU.Count) then
     begin
@@ -1418,11 +1459,100 @@ begin
     RichEdit1.ScrollBars := ssVertical
   else
     RichEdit1.ScrollBars := ssBoth;
-  // The style changes above recreate the handle, so re-apply the text limit.
+  // The style changes above recreate the handle, so re-apply the text limit
+  // and the wrap mode (0 = wrap to window, 1 = no wrap / horizontal scroll).
   SendMessage(RichEdit1.Handle, EM_EXLIMITTEXT, 0, $7FFFFFFE);
+  if RichEdit1.WordWrap then
+    SendMessage(RichEdit1.Handle, EM_SETTARGETDEVICE, 0, 0)
+  else
+    SendMessage(RichEdit1.Handle, EM_SETTARGETDEVICE, 0, 1);
   if FWrapItem <> nil then
     FWrapItem.Checked := RichEdit1.WordWrap;
   UpdateLineNumbers;
+end;
+
+procedure TForm1.ToggleLineNumbers;
+begin
+  FGutter.Visible := not FGutter.Visible;
+  if FLineNumItem <> nil then
+    FLineNumItem.Checked := FGutter.Visible;
+  if FGutter.Visible then
+    UpdateLineNumbers;
+end;
+
+procedure TForm1.ShowCheatSheet;
+const
+  CR = #13#10;
+var
+  Dlg: TForm;
+  Memo: TMemo;
+begin
+  Dlg := TForm.Create(Self);
+  try
+    Dlg.Caption := 'Шпаргалка — возможности и горячие клавиши';
+    Dlg.Position := poOwnerFormCenter;
+    Dlg.BorderStyle := bsSizeable;
+    Dlg.Width := 600;
+    Dlg.Height := 560;
+
+    Memo := TMemo.Create(Dlg);
+    Memo.Parent := Dlg;
+    Memo.Align := alClient;
+    Memo.ReadOnly := True;
+    Memo.ScrollBars := ssVertical;
+    Memo.WordWrap := True;
+    Memo.Font.Name := 'Consolas';
+    Memo.Font.Size := 10;
+    Memo.Text :=
+      'ГОРЯЧИЕ КЛАВИШИ' + CR +
+      '─────────────────────────────────────────────' + CR +
+      'Ctrl+N / Ctrl+O / Ctrl+S   Новый / Открыть / Сохранить' + CR +
+      'Ctrl+Shift+S               Сохранить как' + CR +
+      'Ctrl+F / Ctrl+H            Найти / Заменить' + CR +
+      'Ctrl+G                     Перейти к строке' + CR +
+      'Ctrl+/                     Комментировать строки' + CR +
+      'Ctrl++ / Ctrl+- / Ctrl+0   Масштаб: больше / меньше / сброс' + CR +
+      'Ctrl+колесо мыши           Масштаб' + CR +
+      'F5 / Ctrl+F2               Выполнить / Остановить' + CR +
+      'Ctrl+Z / Ctrl+Y            Отменить / Повторить' + CR +
+      'F1                         Эта шпаргалка' + CR +
+      CR +
+      'РЕДАКТИРОВАНИЕ' + CR +
+      '─────────────────────────────────────────────' + CR +
+      '• Поиск и замена, в т.ч. «Заменить всё» и поиск по кругу.' + CR +
+      '• Переход к строке по номеру.' + CR +
+      '• Комментирование/раскомментирование выделенных строк' + CR +
+      '  (префикс берётся из правил подсветки текущего языка).' + CR +
+      '• Авто-отступ: новая строка наследует отступ предыдущей.' + CR +
+      CR +
+      'ВИД' + CR +
+      '─────────────────────────────────────────────' + CR +
+      '• Номера строк (можно скрыть в меню «Вид»).' + CR +
+      '• Масштаб (Ctrl+колесо или меню).' + CR +
+      '• Перенос строк (вкл/выкл). Для кода рекомендуется ВЫКЛ —' + CR +
+      '  тогда номера строк совпадают со строками точно.' + CR +
+      CR +
+      'ФАЙЛЫ' + CR +
+      '─────────────────────────────────────────────' + CR +
+      '• Открытие/сохранение .rtf и текстовых файлов.' + CR +
+      '• Кодировки: UTF-8 (по умолчанию), CP1251, CP866 —' + CR +
+      '  переключатель на панели инструментов.' + CR +
+      '• Список последних файлов (меню «Файл»).' + CR +
+      '• Открытие перетаскиванием файла в окно (drag & drop).' + CR +
+      CR +
+      'ЗАПУСК' + CR +
+      '─────────────────────────────────────────────' + CR +
+      '• F5 — выполнить; вывод программы идёт в нижнюю панель.' + CR +
+      '• Запуск по расширению: если расширение открытого файла' + CR +
+      '  указано в [Interpreters] файла run_settings.ini, запускается' + CR +
+      '  именно этот файл (иначе — source.py из секции [Run]).' + CR +
+      '• Ctrl+F2 — остановить; по завершении печатается код возврата.' + CR +
+      '• Настройки запуска: меню «Настройки» → run_settings.ini.';
+
+    Dlg.ShowModal;
+  finally
+    Dlg.Free;
+  end;
 end;
 
 procedure TForm1.ZoomBy(Delta: Integer);
